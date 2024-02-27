@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use super::{CollectionGroup, User, UserOrgStatus, UserOrgType, UserOrganization};
+use crate::CONFIG;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -10,6 +11,7 @@ db_object! {
         pub uuid: String,
         pub org_uuid: String,
         pub name: String,
+        pub external_id: Option<String>,
     }
 
     #[derive(Identifiable, Queryable, Insertable)]
@@ -33,23 +35,41 @@ db_object! {
 
 /// Local methods
 impl Collection {
-    pub fn new(org_uuid: String, name: String) -> Self {
-        Self {
+    pub fn new(org_uuid: String, name: String, external_id: Option<String>) -> Self {
+        let mut new_model = Self {
             uuid: crate::util::get_uuid(),
-
             org_uuid,
             name,
-        }
+            external_id: None,
+        };
+
+        new_model.set_external_id(external_id);
+        new_model
     }
 
     pub fn to_json(&self) -> Value {
         json!({
-            "ExternalId": null, // Not support by us
+            "ExternalId": self.external_id,
             "Id": self.uuid,
             "OrganizationId": self.org_uuid,
             "Name": self.name,
             "Object": "collection",
         })
+    }
+
+    pub fn set_external_id(&mut self, external_id: Option<String>) {
+        //Check if external id is empty. We don't want to have
+        //empty strings in the database
+        match external_id {
+            Some(external_id) => {
+                if external_id.is_empty() {
+                    self.external_id = None;
+                } else {
+                    self.external_id = Some(external_id)
+                }
+            }
+            None => self.external_id = None,
+        }
     }
 
     pub async fn to_json_details(
@@ -162,47 +182,74 @@ impl Collection {
     }
 
     pub async fn find_by_user_uuid(user_uuid: String, conn: &mut DbConn) -> Vec<Self> {
-        db_run! { conn: {
-            collections::table
-            .left_join(users_collections::table.on(
-                users_collections::collection_uuid.eq(collections::uuid).and(
-                    users_collections::user_uuid.eq(user_uuid.clone())
+        if CONFIG.org_groups_enabled() {
+            db_run! { conn: {
+                collections::table
+                .left_join(users_collections::table.on(
+                    users_collections::collection_uuid.eq(collections::uuid).and(
+                        users_collections::user_uuid.eq(user_uuid.clone())
+                    )
+                ))
+                .left_join(users_organizations::table.on(
+                    collections::org_uuid.eq(users_organizations::org_uuid).and(
+                        users_organizations::user_uuid.eq(user_uuid.clone())
+                    )
+                ))
+                .left_join(groups_users::table.on(
+                    groups_users::users_organizations_uuid.eq(users_organizations::uuid)
+                ))
+                .left_join(groups::table.on(
+                    groups::uuid.eq(groups_users::groups_uuid)
+                ))
+                .left_join(collections_groups::table.on(
+                    collections_groups::groups_uuid.eq(groups_users::groups_uuid).and(
+                        collections_groups::collections_uuid.eq(collections::uuid)
+                    )
+                ))
+                .filter(
+                    users_organizations::status.eq(UserOrgStatus::Confirmed as i32)
                 )
-            ))
-            .left_join(users_organizations::table.on(
-                collections::org_uuid.eq(users_organizations::org_uuid).and(
-                    users_organizations::user_uuid.eq(user_uuid.clone())
-                )
-            ))
-            .left_join(groups_users::table.on(
-                groups_users::users_organizations_uuid.eq(users_organizations::uuid)
-            ))
-            .left_join(groups::table.on(
-                groups::uuid.eq(groups_users::groups_uuid)
-            ))
-            .left_join(collections_groups::table.on(
-                collections_groups::groups_uuid.eq(groups_users::groups_uuid).and(
-                    collections_groups::collections_uuid.eq(collections::uuid)
-                )
-            ))
-            .filter(
-                users_organizations::status.eq(UserOrgStatus::Confirmed as i32)
-            )
-            .filter(
-                users_collections::user_uuid.eq(user_uuid).or( // Directly accessed collection
-                    users_organizations::access_all.eq(true) // access_all in Organization
-                ).or(
-                    groups::access_all.eq(true) // access_all in groups
-                ).or( // access via groups
-                    groups_users::users_organizations_uuid.eq(users_organizations::uuid).and(
-                        collections_groups::collections_uuid.is_not_null()
+                .filter(
+                    users_collections::user_uuid.eq(user_uuid).or( // Directly accessed collection
+                        users_organizations::access_all.eq(true) // access_all in Organization
+                    ).or(
+                        groups::access_all.eq(true) // access_all in groups
+                    ).or( // access via groups
+                        groups_users::users_organizations_uuid.eq(users_organizations::uuid).and(
+                            collections_groups::collections_uuid.is_not_null()
+                        )
                     )
                 )
-            )
-            .select(collections::all_columns)
-            .distinct()
-            .load::<CollectionDb>(conn).expect("Error loading collections").from_db()
-        }}
+                .select(collections::all_columns)
+                .distinct()
+                .load::<CollectionDb>(conn).expect("Error loading collections").from_db()
+            }}
+        } else {
+            db_run! { conn: {
+                collections::table
+                .left_join(users_collections::table.on(
+                    users_collections::collection_uuid.eq(collections::uuid).and(
+                        users_collections::user_uuid.eq(user_uuid.clone())
+                    )
+                ))
+                .left_join(users_organizations::table.on(
+                    collections::org_uuid.eq(users_organizations::org_uuid).and(
+                        users_organizations::user_uuid.eq(user_uuid.clone())
+                    )
+                ))
+                .filter(
+                    users_organizations::status.eq(UserOrgStatus::Confirmed as i32)
+                )
+                .filter(
+                    users_collections::user_uuid.eq(user_uuid).or( // Directly accessed collection
+                        users_organizations::access_all.eq(true) // access_all in Organization
+                    )
+                )
+                .select(collections::all_columns)
+                .distinct()
+                .load::<CollectionDb>(conn).expect("Error loading collections").from_db()
+            }}
+        }
     }
 
     // Check if a user has access to a specific collection
@@ -258,45 +305,70 @@ impl Collection {
     }
 
     pub async fn find_by_uuid_and_user(uuid: &str, user_uuid: String, conn: &mut DbConn) -> Option<Self> {
-        db_run! { conn: {
-            collections::table
-            .left_join(users_collections::table.on(
-                users_collections::collection_uuid.eq(collections::uuid).and(
-                    users_collections::user_uuid.eq(user_uuid.clone())
-                )
-            ))
-            .left_join(users_organizations::table.on(
-                collections::org_uuid.eq(users_organizations::org_uuid).and(
-                    users_organizations::user_uuid.eq(user_uuid)
-                )
-            ))
-            .left_join(groups_users::table.on(
-                groups_users::users_organizations_uuid.eq(users_organizations::uuid)
-            ))
-            .left_join(groups::table.on(
-                groups::uuid.eq(groups_users::groups_uuid)
-            ))
-            .left_join(collections_groups::table.on(
-                collections_groups::groups_uuid.eq(groups_users::groups_uuid).and(
-                    collections_groups::collections_uuid.eq(collections::uuid)
-                )
-            ))
-            .filter(collections::uuid.eq(uuid))
-            .filter(
-                users_collections::collection_uuid.eq(uuid).or( // Directly accessed collection
-                    users_organizations::access_all.eq(true).or( // access_all in Organization
-                        users_organizations::atype.le(UserOrgType::Admin as i32) // Org admin or owner
-                )).or(
-                    groups::access_all.eq(true) // access_all in groups
-                ).or( // access via groups
-                    groups_users::users_organizations_uuid.eq(users_organizations::uuid).and(
-                        collections_groups::collections_uuid.is_not_null()
+        if CONFIG.org_groups_enabled() {
+            db_run! { conn: {
+                collections::table
+                .left_join(users_collections::table.on(
+                    users_collections::collection_uuid.eq(collections::uuid).and(
+                        users_collections::user_uuid.eq(user_uuid.clone())
                     )
-                )
-            ).select(collections::all_columns)
-            .first::<CollectionDb>(conn).ok()
-            .from_db()
-        }}
+                ))
+                .left_join(users_organizations::table.on(
+                    collections::org_uuid.eq(users_organizations::org_uuid).and(
+                        users_organizations::user_uuid.eq(user_uuid)
+                    )
+                ))
+                .left_join(groups_users::table.on(
+                    groups_users::users_organizations_uuid.eq(users_organizations::uuid)
+                ))
+                .left_join(groups::table.on(
+                    groups::uuid.eq(groups_users::groups_uuid)
+                ))
+                .left_join(collections_groups::table.on(
+                    collections_groups::groups_uuid.eq(groups_users::groups_uuid).and(
+                        collections_groups::collections_uuid.eq(collections::uuid)
+                    )
+                ))
+                .filter(collections::uuid.eq(uuid))
+                .filter(
+                    users_collections::collection_uuid.eq(uuid).or( // Directly accessed collection
+                        users_organizations::access_all.eq(true).or( // access_all in Organization
+                            users_organizations::atype.le(UserOrgType::Admin as i32) // Org admin or owner
+                    )).or(
+                        groups::access_all.eq(true) // access_all in groups
+                    ).or( // access via groups
+                        groups_users::users_organizations_uuid.eq(users_organizations::uuid).and(
+                            collections_groups::collections_uuid.is_not_null()
+                        )
+                    )
+                ).select(collections::all_columns)
+                .first::<CollectionDb>(conn).ok()
+                .from_db()
+            }}
+        } else {
+            db_run! { conn: {
+                collections::table
+                .left_join(users_collections::table.on(
+                    users_collections::collection_uuid.eq(collections::uuid).and(
+                        users_collections::user_uuid.eq(user_uuid.clone())
+                    )
+                ))
+                .left_join(users_organizations::table.on(
+                    collections::org_uuid.eq(users_organizations::org_uuid).and(
+                        users_organizations::user_uuid.eq(user_uuid)
+                    )
+                ))
+                .filter(collections::uuid.eq(uuid))
+                .filter(
+                    users_collections::collection_uuid.eq(uuid).or( // Directly accessed collection
+                        users_organizations::access_all.eq(true).or( // access_all in Organization
+                            users_organizations::atype.le(UserOrgType::Admin as i32) // Org admin or owner
+                    ))
+                ).select(collections::all_columns)
+                .first::<CollectionDb>(conn).ok()
+                .from_db()
+            }}
+        }
     }
 
     pub async fn is_writable_by_user(&self, user_uuid: &str, conn: &mut DbConn) -> bool {

@@ -1,8 +1,13 @@
 //
 // Web Headers and caching
 //
-use std::io::{Cursor, ErrorKind};
+use std::{
+    collections::HashMap,
+    io::{Cursor, ErrorKind},
+    ops::Deref,
+};
 
+use num_traits::ToPrimitive;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::{ContentType, Header, HeaderMap, Method, Status},
@@ -30,29 +35,47 @@ impl Fairing for AppHeaders {
     }
 
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
+        let req_uri_path = req.uri().path();
+        let req_headers = req.headers();
+
+        // Check if this connection is an Upgrade/WebSocket connection and return early
+        // We do not want add any extra headers, this could cause issues with reverse proxies or CloudFlare
+        if req_uri_path.ends_with("notifications/hub") || req_uri_path.ends_with("notifications/anonymous-hub") {
+            match (req_headers.get_one("connection"), req_headers.get_one("upgrade")) {
+                (Some(c), Some(u))
+                    if c.to_lowercase().contains("upgrade") && u.to_lowercase().contains("websocket") =>
+                {
+                    // Remove headers which could cause websocket connection issues
+                    res.remove_header("X-Frame-Options");
+                    res.remove_header("X-Content-Type-Options");
+                    res.remove_header("Permissions-Policy");
+                    return;
+                }
+                (_, _) => (),
+            }
+        }
+
         res.set_raw_header("Permissions-Policy", "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()");
         res.set_raw_header("Referrer-Policy", "same-origin");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
         res.set_raw_header("X-XSS-Protection", "0");
 
-        let req_uri_path = req.uri().path();
-
         // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
         // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
-        // This is the same behaviour as upstream Bitwarden.
+        // This is the same behavior as upstream Bitwarden.
         if !req_uri_path.ends_with("connector.html") {
             // # Frame Ancestors:
             // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
             // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
             // Firefox Browser Add-ons: https://addons.mozilla.org/en-US/firefox/addon/bitwarden-password-manager/
             // # img/child/frame src:
-            // Have I Been Pwned and Gravator to allow those calls to work.
+            // Have I Been Pwned to allow those calls to work.
             // # Connect src:
             // Leaked Passwords check: api.pwnedpasswords.com
             // 2FA/MFA Site check: api.2fa.directory
             // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
-            // app.simplelogin.io, app.anonaddy.com, api.fastmail.com, quack.duckduckgo.com
+            // app.simplelogin.io, app.addy.io, api.fastmail.com, quack.duckduckgo.com
             let csp = format!(
                 "default-src 'self'; \
                 base-uri 'self'; \
@@ -69,14 +92,14 @@ impl Fairing for AppHeaders {
                   {allowed_iframe_ancestors}; \
                 img-src 'self' data: \
                   https://haveibeenpwned.com \
-                  https://www.gravatar.com \
                   {icon_service_csp}; \
                 connect-src 'self' \
                   https://api.pwnedpasswords.com \
                   https://api.2fa.directory \
                   https://app.simplelogin.io/api/ \
-                  https://app.anonaddy.com/api/ \
+                  https://app.addy.io/api/ \
                   https://api.fastmail.com/ \
+                  https://api.forwardemail.net \
                   ;\
                 ",
                 icon_service_csp = CONFIG._icon_service_csp(),
@@ -209,6 +232,14 @@ impl std::fmt::Display for SafeString {
     }
 }
 
+impl Deref for SafeString {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl AsRef<Path> for SafeString {
     #[inline]
     fn as_ref(&self) -> &Path {
@@ -334,21 +365,17 @@ pub fn write_file(path: &str, content: &[u8]) -> Result<(), crate::error::Error>
 }
 
 pub fn delete_file(path: &str) -> IOResult<()> {
-    let res = fs::remove_file(path);
-
-    if let Some(parent) = Path::new(path).parent() {
-        // If the directory isn't empty, this returns an error, which we ignore
-        // We only want to delete the folder if it's empty
-        fs::remove_dir(parent).ok();
-    }
-
-    res
+    fs::remove_file(path)
 }
 
-pub fn get_display_size(size: i32) -> String {
+pub fn get_display_size(size: i64) -> String {
     const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
 
-    let mut size: f64 = size.into();
+    // If we're somehow too big for a f64, just return the size in bytes
+    let Some(mut size) = size.to_f64() else {
+        return format!("{size} bytes");
+    };
+
     let mut unit_counter = 0;
 
     loop {
@@ -489,7 +516,7 @@ pub fn format_naive_datetime_local(dt: &NaiveDateTime, fmt: &str) -> String {
 ///
 /// https://httpwg.org/specs/rfc7231.html#http.date
 pub fn format_datetime_http(dt: &DateTime<Local>) -> String {
-    let expiry_time: chrono::DateTime<chrono::Utc> = chrono::DateTime::from_utc(dt.naive_utc(), chrono::Utc);
+    let expiry_time = DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt.naive_utc(), chrono::Utc);
 
     // HACK: HTTP expects the date to always be GMT (UTC) rather than giving an
     // offset (which would always be 0 in UTC anyway)
@@ -504,14 +531,17 @@ pub fn parse_date(date: &str) -> NaiveDateTime {
 // Deployment environment methods
 //
 
-/// Returns true if the program is running in Docker or Podman.
-pub fn is_running_in_docker() -> bool {
-    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+/// Returns true if the program is running in Docker, Podman or Kubernetes.
+pub fn is_running_in_container() -> bool {
+    Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+        || Path::new("/run/secrets/kubernetes.io").exists()
+        || Path::new("/var/run/secrets/kubernetes.io").exists()
 }
 
-/// Simple check to determine on which docker base image vaultwarden is running.
+/// Simple check to determine on which container base image vaultwarden is running.
 /// We build images based upon Debian or Alpine, so these we check here.
-pub fn docker_base_image() -> &'static str {
+pub fn container_base_image() -> &'static str {
     if Path::new("/etc/debian_version").exists() {
         "Debian"
     } else if Path::new("/etc/alpine-release").exists() {
@@ -607,12 +637,53 @@ fn upcase_value(value: Value) -> Value {
     }
 }
 
-// Inner function to handle some speciale case for the 'ssn' key.
+// Inner function to handle a special case for the 'ssn' key.
 // This key is part of the Identity Cipher (Social Security Number)
 fn _process_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
         "ssn" => "SSN".into(),
         _ => self::upcase_first(key),
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum NumberOrString {
+    Number(i64),
+    String(String),
+}
+
+impl NumberOrString {
+    pub fn into_string(self) -> String {
+        match self {
+            NumberOrString::Number(n) => n.to_string(),
+            NumberOrString::String(s) => s,
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_i32(&self) -> Result<i32, crate::Error> {
+        use std::num::ParseIntError as PIE;
+        match self {
+            NumberOrString::Number(n) => match n.to_i32() {
+                Some(n) => Ok(n),
+                None => err!("Number does not fit in i32"),
+            },
+            NumberOrString::String(s) => {
+                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
+            }
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_i64(&self) -> Result<i64, crate::Error> {
+        use std::num::ParseIntError as PIE;
+        match self {
+            NumberOrString::Number(n) => Ok(*n),
+            NumberOrString::String(s) => {
+                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
+            }
+        }
     }
 }
 
@@ -725,4 +796,12 @@ pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
 
         value => value,
     }
+}
+
+/// Parses the experimental client feature flags string into a HashMap.
+pub fn parse_experimental_client_feature_flags(experimental_client_feature_flags: &str) -> HashMap<String, bool> {
+    let feature_states =
+        experimental_client_feature_flags.to_lowercase().split(',').map(|f| (f.trim().to_owned(), true)).collect();
+
+    feature_states
 }

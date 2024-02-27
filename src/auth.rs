@@ -24,6 +24,7 @@ static JWT_VERIFYEMAIL_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|verifyema
 static JWT_ADMIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|admin", CONFIG.domain_origin()));
 static JWT_SEND_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|send", CONFIG.domain_origin()));
 static JWT_ORG_API_KEY_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|api.organization", CONFIG.domain_origin()));
+static JWT_FILE_DOWNLOAD_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|file_download", CONFIG.domain_origin()));
 
 static PRIVATE_RSA_KEY: Lazy<EncodingKey> = Lazy::new(|| {
     let key =
@@ -98,6 +99,10 @@ pub fn decode_api_org(token: &str) -> Result<OrgApiKeyLoginJwtClaims, Error> {
     decode_jwt(token, JWT_ORG_API_KEY_ISSUER.to_string())
 }
 
+pub fn decode_file_download(token: &str) -> Result<FileDownloadClaims, Error> {
+    decode_jwt(token, JWT_FILE_DOWNLOAD_ISSUER.to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginJwtClaims {
     // Not before
@@ -114,10 +119,16 @@ pub struct LoginJwtClaims {
     pub email: String,
     pub email_verified: bool,
 
-    pub orgowner: Vec<String>,
-    pub orgadmin: Vec<String>,
-    pub orguser: Vec<String>,
-    pub orgmanager: Vec<String>,
+    // ---
+    // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+    // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+    // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+    // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+    // ---
+    // pub orgowner: Vec<String>,
+    // pub orgadmin: Vec<String>,
+    // pub orguser: Vec<String>,
+    // pub orgmanager: Vec<String>,
 
     // user security_stamp
     pub sstamp: String,
@@ -231,6 +242,31 @@ pub fn generate_organization_api_key_login_claims(uuid: String, org_id: String) 
         client_id: format!("organization.{org_id}"),
         client_sub: org_id,
         scope: vec!["api.organization".into()],
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileDownloadClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+
+    pub file_id: String,
+}
+
+pub fn generate_file_download_claims(uuid: String, file_id: String) -> FileDownloadClaims {
+    let time_now = Utc::now().naive_utc();
+    FileDownloadClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::minutes(5)).timestamp(),
+        iss: JWT_FILE_DOWNLOAD_ISSUER.to_string(),
+        sub: uuid,
+        file_id,
     }
 }
 
@@ -792,6 +828,29 @@ impl<'r> FromRequest<'r> for ClientIp {
 
         Outcome::Success(ClientIp {
             ip,
+        })
+    }
+}
+
+pub struct WsAccessTokenHeader {
+    pub access_token: Option<String>,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for WsAccessTokenHeader {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = request.headers();
+
+        // Get access_token
+        let access_token = match headers.get_one("Authorization") {
+            Some(a) => a.rsplit("Bearer ").next().map(String::from),
+            None => None,
+        };
+
+        Outcome::Success(Self {
+            access_token,
         })
     }
 }

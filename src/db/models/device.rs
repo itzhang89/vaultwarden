@@ -1,6 +1,7 @@
 use chrono::{NaiveDateTime, Utc};
 
 use crate::{crypto, CONFIG};
+use core::fmt;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -58,12 +59,7 @@ impl Device {
         self.twofactor_remember = None;
     }
 
-    pub fn refresh_tokens(
-        &mut self,
-        user: &super::User,
-        orgs: Vec<super::UserOrganization>,
-        scope: Vec<String>,
-    ) -> (String, i64) {
+    pub fn refresh_tokens(&mut self, user: &super::User, scope: Vec<String>) -> (String, i64) {
         // If there is no refresh token, we create one
         if self.refresh_token.is_empty() {
             use data_encoding::BASE64URL;
@@ -74,10 +70,17 @@ impl Device {
         let time_now = Utc::now().naive_utc();
         self.updated_at = time_now;
 
-        let orgowner: Vec<_> = orgs.iter().filter(|o| o.atype == 0).map(|o| o.org_uuid.clone()).collect();
-        let orgadmin: Vec<_> = orgs.iter().filter(|o| o.atype == 1).map(|o| o.org_uuid.clone()).collect();
-        let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
-        let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
+        // ---
+        // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+        // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+        // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+        // ---
+        // fn arg: orgs: Vec<super::UserOrganization>,
+        // ---
+        // let orgowner: Vec<_> = orgs.iter().filter(|o| o.atype == 0).map(|o| o.org_uuid.clone()).collect();
+        // let orgadmin: Vec<_> = orgs.iter().filter(|o| o.atype == 1).map(|o| o.org_uuid.clone()).collect();
+        // let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
+        // let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
 
         // Create the JWT claims struct, to send to the client
         use crate::auth::{encode_jwt, LoginJwtClaims, DEFAULT_VALIDITY, JWT_LOGIN_ISSUER};
@@ -92,11 +95,16 @@ impl Device {
             email: user.email.clone(),
             email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
 
-            orgowner,
-            orgadmin,
-            orguser,
-            orgmanager,
-
+            // ---
+            // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+            // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+            // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+            // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+            // ---
+            // orgowner,
+            // orgadmin,
+            // orguser,
+            // orgmanager,
             sstamp: user.security_stamp.clone(),
             device: self.uuid.clone(),
             scope,
@@ -104,6 +112,14 @@ impl Device {
         };
 
         (encode_jwt(&claims), DEFAULT_VALIDITY.num_seconds())
+    }
+
+    pub fn is_push_device(&self) -> bool {
+        matches!(DeviceType::from_i32(self.atype), DeviceType::Android | DeviceType::Ios)
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.push_uuid.is_some()
     }
 }
 
@@ -202,6 +218,7 @@ impl Device {
                 .from_db()
         }}
     }
+
     pub async fn find_push_devices_by_user(user_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             devices::table
@@ -223,5 +240,92 @@ impl Device {
             .ok()
             .unwrap_or(0) != 0
         }}
+    }
+}
+
+pub enum DeviceType {
+    Android = 0,
+    Ios = 1,
+    ChromeExtension = 2,
+    FirefoxExtension = 3,
+    OperaExtension = 4,
+    EdgeExtension = 5,
+    WindowsDesktop = 6,
+    MacOsDesktop = 7,
+    LinuxDesktop = 8,
+    ChromeBrowser = 9,
+    FirefoxBrowser = 10,
+    OperaBrowser = 11,
+    EdgeBrowser = 12,
+    IEBrowser = 13,
+    UnknownBrowser = 14,
+    AndroidAmazon = 15,
+    Uwp = 16,
+    SafariBrowser = 17,
+    VivaldiBrowser = 18,
+    VivaldiExtension = 19,
+    SafariExtension = 20,
+    Sdk = 21,
+    Server = 22,
+}
+
+impl fmt::Display for DeviceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DeviceType::Android => write!(f, "Android"),
+            DeviceType::Ios => write!(f, "iOS"),
+            DeviceType::ChromeExtension => write!(f, "Chrome Extension"),
+            DeviceType::FirefoxExtension => write!(f, "Firefox Extension"),
+            DeviceType::OperaExtension => write!(f, "Opera Extension"),
+            DeviceType::EdgeExtension => write!(f, "Edge Extension"),
+            DeviceType::WindowsDesktop => write!(f, "Windows Desktop"),
+            DeviceType::MacOsDesktop => write!(f, "MacOS Desktop"),
+            DeviceType::LinuxDesktop => write!(f, "Linux Desktop"),
+            DeviceType::ChromeBrowser => write!(f, "Chrome Browser"),
+            DeviceType::FirefoxBrowser => write!(f, "Firefox Browser"),
+            DeviceType::OperaBrowser => write!(f, "Opera Browser"),
+            DeviceType::EdgeBrowser => write!(f, "Edge Browser"),
+            DeviceType::IEBrowser => write!(f, "Internet Explorer"),
+            DeviceType::UnknownBrowser => write!(f, "Unknown Browser"),
+            DeviceType::AndroidAmazon => write!(f, "Android Amazon"),
+            DeviceType::Uwp => write!(f, "UWP"),
+            DeviceType::SafariBrowser => write!(f, "Safari Browser"),
+            DeviceType::VivaldiBrowser => write!(f, "Vivaldi Browser"),
+            DeviceType::VivaldiExtension => write!(f, "Vivaldi Extension"),
+            DeviceType::SafariExtension => write!(f, "Safari Extension"),
+            DeviceType::Sdk => write!(f, "SDK"),
+            DeviceType::Server => write!(f, "Server"),
+        }
+    }
+}
+
+impl DeviceType {
+    pub fn from_i32(value: i32) -> DeviceType {
+        match value {
+            0 => DeviceType::Android,
+            1 => DeviceType::Ios,
+            2 => DeviceType::ChromeExtension,
+            3 => DeviceType::FirefoxExtension,
+            4 => DeviceType::OperaExtension,
+            5 => DeviceType::EdgeExtension,
+            6 => DeviceType::WindowsDesktop,
+            7 => DeviceType::MacOsDesktop,
+            8 => DeviceType::LinuxDesktop,
+            9 => DeviceType::ChromeBrowser,
+            10 => DeviceType::FirefoxBrowser,
+            11 => DeviceType::OperaBrowser,
+            12 => DeviceType::EdgeBrowser,
+            13 => DeviceType::IEBrowser,
+            14 => DeviceType::UnknownBrowser,
+            15 => DeviceType::AndroidAmazon,
+            16 => DeviceType::Uwp,
+            17 => DeviceType::SafariBrowser,
+            18 => DeviceType::VivaldiBrowser,
+            19 => DeviceType::VivaldiExtension,
+            20 => DeviceType::SafariExtension,
+            21 => DeviceType::Sdk,
+            22 => DeviceType::Server,
+            _ => DeviceType::UnknownBrowser,
+        }
     }
 }

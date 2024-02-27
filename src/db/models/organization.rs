@@ -31,6 +31,7 @@ db_object! {
         pub status: i32,
         pub atype: i32,
         pub reset_password_key: Option<String>,
+        pub external_id: Option<String>,
     }
 
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -208,19 +209,37 @@ impl UserOrganization {
             status: UserOrgStatus::Accepted as i32,
             atype: UserOrgType::User as i32,
             reset_password_key: None,
+            external_id: None,
         }
     }
 
-    pub fn restore(&mut self) {
-        if self.status < UserOrgStatus::Accepted as i32 {
+    pub fn restore(&mut self) -> bool {
+        if self.status < UserOrgStatus::Invited as i32 {
             self.status += ACTIVATE_REVOKE_DIFF;
+            return true;
         }
+        false
     }
 
-    pub fn revoke(&mut self) {
+    pub fn revoke(&mut self) -> bool {
         if self.status > UserOrgStatus::Revoked as i32 {
             self.status -= ACTIVATE_REVOKE_DIFF;
+            return true;
         }
+        false
+    }
+
+    pub fn set_external_id(&mut self, external_id: Option<String>) -> bool {
+        //Check if external id is empty. We don't want to have
+        //empty strings in the database
+        if self.external_id != external_id {
+            self.external_id = match external_id {
+                Some(external_id) if !external_id.is_empty() => Some(external_id),
+                _ => None,
+            };
+            return true;
+        }
+        false
     }
 }
 
@@ -396,7 +415,7 @@ impl UserOrganization {
         let user = User::find_by_uuid(&self.user_uuid, conn).await.unwrap();
 
         // Because BitWarden want the status to be -1 for revoked users we need to catch that here.
-        // We subtract/add a number so we can restore/activate the user to it's previouse state again.
+        // We subtract/add a number so we can restore/activate the user to it's previous state again.
         let status = if self.status < UserOrgStatus::Revoked as i32 {
             UserOrgStatus::Revoked as i32
         } else {
@@ -434,6 +453,7 @@ impl UserOrganization {
             "UserId": self.user_uuid,
             "Name": user.name,
             "Email": user.email,
+            "ExternalId": self.external_id,
             "Groups": groups,
             "Collections": collections,
 
@@ -441,7 +461,7 @@ impl UserOrganization {
             "Type": self.atype,
             "AccessAll": self.access_all,
             "TwoFactorEnabled": twofactor_enabled,
-            "ResetPasswordEnrolled":self.reset_password_key.is_some(),
+            "ResetPasswordEnrolled": self.reset_password_key.is_some(),
 
             "Object": "organizationUserUserDetails",
         })
@@ -474,7 +494,7 @@ impl UserOrganization {
         };
 
         // Because BitWarden want the status to be -1 for revoked users we need to catch that here.
-        // We subtract/add a number so we can restore/activate the user to it's previouse state again.
+        // We subtract/add a number so we can restore/activate the user to it's previous state again.
         let status = if self.status < UserOrgStatus::Revoked as i32 {
             UserOrgStatus::Revoked as i32
         } else {
@@ -628,8 +648,7 @@ impl UserOrganization {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.eq(UserOrgStatus::Accepted as i32))
-                .or_filter(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                .filter(users_organizations::status.eq(UserOrgStatus::Accepted as i32).or(users_organizations::status.eq(UserOrgStatus::Confirmed as i32)))
                 .count()
                 .first::<i64>(conn)
                 .unwrap_or(0)
@@ -642,6 +661,16 @@ impl UserOrganization {
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .load::<UserOrganizationDb>(conn)
                 .expect("Error loading user organizations").from_db()
+        }}
+    }
+
+    pub async fn find_confirmed_by_org(org_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                .load::<UserOrganizationDb>(conn)
+                .unwrap_or_default().from_db()
         }}
     }
 
@@ -749,6 +778,32 @@ impl UserOrganization {
         }}
     }
 
+    pub async fn find_by_cipher_and_org_with_group(cipher_uuid: &str, org_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            users_organizations::table
+            .filter(users_organizations::org_uuid.eq(org_uuid))
+            .inner_join(groups_users::table.on(
+                groups_users::users_organizations_uuid.eq(users_organizations::uuid)
+            ))
+            .left_join(collections_groups::table.on(
+                collections_groups::groups_uuid.eq(groups_users::groups_uuid)
+            ))
+            .left_join(groups::table.on(groups::uuid.eq(groups_users::groups_uuid)))
+            .left_join(ciphers_collections::table.on(
+                    ciphers_collections::collection_uuid.eq(collections_groups::collections_uuid).and(ciphers_collections::cipher_uuid.eq(&cipher_uuid))
+
+                ))
+            .filter(
+                    groups::access_all.eq(true).or( // AccessAll via groups
+                        ciphers_collections::cipher_uuid.eq(&cipher_uuid) // ..or access to collection via group
+                    )
+                )
+                .select(users_organizations::all_columns)
+                .distinct()
+            .load::<UserOrganizationDb>(conn).expect("Error loading user organizations with groups").from_db()
+        }}
+    }
+
     pub async fn user_has_ge_admin_access_to_cipher(user_uuid: &str, cipher_uuid: &str, conn: &mut DbConn) -> bool {
         db_run! { conn: {
             users_organizations::table
@@ -775,6 +830,17 @@ impl UserOrganization {
             )
             .select(users_organizations::all_columns)
             .load::<UserOrganizationDb>(conn).expect("Error loading user organizations").from_db()
+        }}
+    }
+
+    pub async fn find_by_external_id_and_org(ext_id: &str, org_uuid: &str, conn: &mut DbConn) -> Option<Self> {
+        db_run! {conn: {
+            users_organizations::table
+            .filter(
+                users_organizations::external_id.eq(ext_id)
+                .and(users_organizations::org_uuid.eq(org_uuid))
+            )
+            .first::<UserOrganizationDb>(conn).ok().from_db()
         }}
     }
 }
@@ -804,7 +870,7 @@ impl OrganizationApiKey {
                 let value = OrganizationApiKeyDb::to_db(self);
                 diesel::insert_into(organization_api_key::table)
                     .values(&value)
-                    .on_conflict(organization_api_key::uuid)
+                    .on_conflict((organization_api_key::uuid, organization_api_key::org_uuid))
                     .do_update()
                     .set(&value)
                     .execute(conn)

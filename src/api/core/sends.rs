@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
+use num_traits::ToPrimitive;
 use rocket::form::Form;
 use rocket::fs::NamedFile;
 use rocket::fs::TempFile;
@@ -8,17 +9,17 @@ use rocket::serde::json::Json;
 use serde_json::Value;
 
 use crate::{
-    api::{ApiResult, EmptyResult, JsonResult, JsonUpcase, Notify, NumberOrString, UpdateType},
+    api::{ApiResult, EmptyResult, JsonResult, JsonUpcase, Notify, UpdateType},
     auth::{ClientIp, Headers, Host},
     db::{models::*, DbConn, DbPool},
-    util::SafeString,
+    util::{NumberOrString, SafeString},
     CONFIG,
 };
 
 const SEND_INACCESSIBLE_MSG: &str = "Send does not exist or is no longer available";
 
 // The max file size allowed by Bitwarden clients and add an extra 5% to avoid issues
-const SIZE_525_MB: u64 = 550_502_400;
+const SIZE_525_MB: i64 = 550_502_400;
 
 pub fn routes() -> Vec<rocket::Route> {
     routes![
@@ -216,28 +217,39 @@ async fn post_send_file(data: Form<UploadData<'_>>, headers: Headers, mut conn: 
     } = data.into_inner();
     let model = model.into_inner().data;
 
+    let Some(size) = data.len().to_i64() else {
+        err!("Invalid send size");
+    };
+    if size < 0 {
+        err!("Send size can't be negative")
+    }
+
     enforce_disable_hide_email_policy(&model, &headers, &mut conn).await?;
 
-    let size_limit = match CONFIG.user_attachment_limit() {
+    let size_limit = match CONFIG.user_send_limit() {
         Some(0) => err!("File uploads are disabled"),
         Some(limit_kb) => {
-            let left = (limit_kb * 1024) - Attachment::size_by_user(&headers.user.uuid, &mut conn).await;
+            let Some(already_used) = Send::size_by_user(&headers.user.uuid, &mut conn).await else {
+                err!("Existing sends overflow")
+            };
+            let Some(left) = limit_kb.checked_mul(1024).and_then(|l| l.checked_sub(already_used)) else {
+                err!("Send size overflow");
+            };
             if left <= 0 {
-                err!("Attachment storage limit reached! Delete some attachments to free up space")
+                err!("Send storage limit reached! Delete some sends to free up space")
             }
-            std::cmp::Ord::max(left as u64, SIZE_525_MB)
+            i64::clamp(left, 0, SIZE_525_MB)
         }
         None => SIZE_525_MB,
     };
 
+    if size > size_limit {
+        err!("Send storage limit exceeded with this file");
+    }
+
     let mut send = create_send(model, headers.user.uuid)?;
     if send.atype != SendType::File as i32 {
         err!("Send content is not a file");
-    }
-
-    let size = data.len();
-    if size > size_limit {
-        err!("Attachment storage limit exceeded with this file");
     }
 
     let file_id = crate::crypto::generate_send_id();
@@ -253,7 +265,7 @@ async fn post_send_file(data: Form<UploadData<'_>>, headers: Headers, mut conn: 
     if let Some(o) = data_value.as_object_mut() {
         o.insert(String::from("Id"), Value::String(file_id));
         o.insert(String::from("Size"), Value::Number(size.into()));
-        o.insert(String::from("SizeName"), Value::String(crate::util::get_display_size(size as i32)));
+        o.insert(String::from("SizeName"), Value::String(crate::util::get_display_size(size)));
     }
     send.data = serde_json::to_string(&data_value)?;
 
@@ -285,24 +297,32 @@ async fn post_send_file_v2(data: JsonUpcase<SendData>, headers: Headers, mut con
     enforce_disable_hide_email_policy(&data, &headers, &mut conn).await?;
 
     let file_length = match &data.FileLength {
-        Some(m) => Some(m.into_i32()?),
-        _ => None,
+        Some(m) => m.into_i64()?,
+        _ => err!("Invalid send length"),
     };
+    if file_length < 0 {
+        err!("Send size can't be negative")
+    }
 
-    let size_limit = match CONFIG.user_attachment_limit() {
+    let size_limit = match CONFIG.user_send_limit() {
         Some(0) => err!("File uploads are disabled"),
         Some(limit_kb) => {
-            let left = (limit_kb * 1024) - Attachment::size_by_user(&headers.user.uuid, &mut conn).await;
+            let Some(already_used) = Send::size_by_user(&headers.user.uuid, &mut conn).await else {
+                err!("Existing sends overflow")
+            };
+            let Some(left) = limit_kb.checked_mul(1024).and_then(|l| l.checked_sub(already_used)) else {
+                err!("Send size overflow");
+            };
             if left <= 0 {
-                err!("Attachment storage limit reached! Delete some attachments to free up space")
+                err!("Send storage limit reached! Delete some sends to free up space")
             }
-            std::cmp::Ord::max(left as u64, SIZE_525_MB)
+            i64::clamp(left, 0, SIZE_525_MB)
         }
         None => SIZE_525_MB,
     };
 
-    if file_length.is_some() && file_length.unwrap() as u64 > size_limit {
-        err!("Attachment storage limit exceeded with this file");
+    if file_length > size_limit {
+        err!("Send storage limit exceeded with this file");
     }
 
     let mut send = create_send(data, headers.user.uuid)?;
@@ -312,8 +332,8 @@ async fn post_send_file_v2(data: JsonUpcase<SendData>, headers: Headers, mut con
     let mut data_value: Value = serde_json::from_str(&send.data)?;
     if let Some(o) = data_value.as_object_mut() {
         o.insert(String::from("Id"), Value::String(file_id.clone()));
-        o.insert(String::from("Size"), Value::Number(file_length.unwrap().into()));
-        o.insert(String::from("SizeName"), Value::String(crate::util::get_display_size(file_length.unwrap())));
+        o.insert(String::from("Size"), Value::Number(file_length.into()));
+        o.insert(String::from("SizeName"), Value::String(crate::util::get_display_size(file_length)));
     }
     send.data = serde_json::to_string(&data_value)?;
     send.save(&mut conn).await?;
@@ -340,26 +360,33 @@ async fn post_send_file_v2_data(
 
     let mut data = data.into_inner();
 
-    if let Some(send) = Send::find_by_uuid(send_uuid, &mut conn).await {
-        let folder_path = tokio::fs::canonicalize(&CONFIG.sends_folder()).await?.join(send_uuid);
-        let file_path = folder_path.join(file_id);
-        tokio::fs::create_dir_all(&folder_path).await?;
+    let Some(send) = Send::find_by_uuid(send_uuid, &mut conn).await else {
+        err!("Send not found. Unable to save the file.")
+    };
 
-        if let Err(_err) = data.data.persist_to(&file_path).await {
-            data.data.move_copy_to(file_path).await?
-        }
-
-        nt.send_send_update(
-            UpdateType::SyncSendCreate,
-            &send,
-            &send.update_users_revision(&mut conn).await,
-            &headers.device.uuid,
-            &mut conn,
-        )
-        .await;
-    } else {
-        err!("Send not found. Unable to save the file.");
+    let Some(send_user_id) = &send.user_uuid else {
+        err!("Sends are only supported for users at the moment")
+    };
+    if send_user_id != &headers.user.uuid {
+        err!("Send doesn't belong to user");
     }
+
+    let folder_path = tokio::fs::canonicalize(&CONFIG.sends_folder()).await?.join(send_uuid);
+    let file_path = folder_path.join(file_id);
+    tokio::fs::create_dir_all(&folder_path).await?;
+
+    if let Err(_err) = data.data.persist_to(&file_path).await {
+        data.data.move_copy_to(file_path).await?
+    }
+
+    nt.send_send_update(
+        UpdateType::SyncSendCreate,
+        &send,
+        &send.update_users_revision(&mut conn).await,
+        &headers.device.uuid,
+        &mut conn,
+    )
+    .await;
 
     Ok(())
 }
@@ -374,7 +401,6 @@ pub struct SendAccessData {
 async fn post_access(
     access_id: &str,
     data: JsonUpcase<SendAccessData>,
-    headers: Headers,
     mut conn: DbConn,
     ip: ClientIp,
     nt: Notify<'_>,
@@ -423,7 +449,7 @@ async fn post_access(
         UpdateType::SyncSendUpdate,
         &send,
         &send.update_users_revision(&mut conn).await,
-        &headers.device.uuid,
+        &String::from("00000000-0000-0000-0000-000000000000"),
         &mut conn,
     )
     .await;
@@ -437,7 +463,6 @@ async fn post_access_file(
     file_id: &str,
     data: JsonUpcase<SendAccessData>,
     host: Host,
-    headers: Headers,
     mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
@@ -482,7 +507,7 @@ async fn post_access_file(
         UpdateType::SyncSendUpdate,
         &send,
         &send.update_users_revision(&mut conn).await,
-        &headers.device.uuid,
+        &String::from("00000000-0000-0000-0000-000000000000"),
         &mut conn,
     )
     .await;

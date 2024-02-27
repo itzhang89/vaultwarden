@@ -9,7 +9,7 @@ use reqwest::Url;
 use crate::{
     db::DbConnType,
     error::Error,
-    util::{get_env, get_env_bool},
+    util::{get_env, get_env_bool, parse_experimental_client_feature_flags},
 };
 
 static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
@@ -126,7 +126,7 @@ macro_rules! make_config {
 
                 if show_overrides && !overrides.is_empty() {
                     // We can't use warn! here because logging isn't setup yet.
-                    println!("[WARNING] The following environment variables are being overriden by the config.json file.");
+                    println!("[WARNING] The following environment variables are being overridden by the config.json file.");
                     println!("[WARNING] Please use the admin panel to make changes to them:");
                     println!("[WARNING] {}\n", overrides.join(", "));
                 }
@@ -164,7 +164,7 @@ macro_rules! make_config {
             )+)+
 
             pub fn prepare_json(&self) -> serde_json::Value {
-                let (def, cfg, overriden) = {
+                let (def, cfg, overridden) = {
                     let inner = &self.inner.read().unwrap();
                     (inner._env.build(), inner.config.clone(), inner._overrides.clone())
                 };
@@ -211,7 +211,7 @@ macro_rules! make_config {
                                 element.insert("default".into(), serde_json::to_value(def.$name).unwrap());
                                 element.insert("type".into(), (_get_form_type(stringify!($ty))).into());
                                 element.insert("doc".into(), (_get_doc(concat!($($doc),+))).into());
-                                element.insert("overridden".into(), (overriden.contains(&paste::paste!(stringify!([<$name:upper>])).into())).into());
+                                element.insert("overridden".into(), (overridden.contains(&paste::paste!(stringify!([<$name:upper>])).into())).into());
                                 element
                             }),
                         )+
@@ -380,8 +380,10 @@ make_config! {
     push {
         /// Enable push notifications
         push_enabled:           bool,   false,  def,    false;
-        /// Push relay base uri
+        /// Push relay uri
         push_relay_uri:         String, false,  def,    "https://push.bitwarden.com".to_string();
+        /// Push identity uri
+        push_identity_uri:      String, false,  def,    "https://identity.bitwarden.com".to_string();
         /// Installation id |> The installation id from https://bitwarden.com/host
         push_installation_id:   Pass,   false,  def,    String::new();
         /// Installation key |> The installation key from https://bitwarden.com/host
@@ -409,6 +411,10 @@ make_config! {
         /// Event cleanup schedule |> Cron schedule of the job that cleans old events from the event table.
         /// Defaults to daily. Set blank to disable this job.
         event_cleanup_schedule:   String, false,  def,    "0 10 0 * * *".to_string();
+        /// Auth Request cleanup schedule |> Cron schedule of the job that cleans old auth requests from the auth request.
+        /// Defaults to every minute. Set blank to disable this job.
+        auth_request_purge_schedule:   String, false,  def,    "30 * * * * *".to_string();
+
     },
 
     /// General settings
@@ -436,6 +442,8 @@ make_config! {
         user_attachment_limit:  i64,    true,   option;
         /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org.
         org_attachment_limit:   i64,    true,   option;
+        /// Per-user send storage limit (KB) |> Max kilobytes of sends storage allowed per user. When this limit is reached, the user will not be allowed to upload further sends.
+        user_send_limit:   i64,    true,   option;
 
         /// Trash auto-delete days |> Number of days to wait before auto-deleting a trashed item.
         /// If unset, trashed items are not auto-deleted. This setting applies globally, so make
@@ -474,8 +482,10 @@ make_config! {
         /// Invitation token expiration time (in hours) |> The number of hours after which an organization invite token, emergency access invite token,
         /// email verification token and deletion request token will expire (must be at least 1)
         invitation_expiration_hours: u32, false, def, 120;
-        /// Allow emergency access |> Controls whether users can enable emergency access to their accounts. This setting applies globally to all users.
+        /// Enable emergency access |> Controls whether users can enable emergency access to their accounts. This setting applies globally to all users.
         emergency_access_allowed:    bool,   true,   def,    true;
+        /// Allow email change |> Controls whether users can change their email. This setting applies globally to all users.
+        email_change_allowed:    bool,   true,   def,    true;
         /// Password iterations |> Number of server-side passwords hashing iterations for the password hash.
         /// The default for new users. If changed, it will be updated during login for existing users.
         password_iterations:    i32,    true,   def,    600_000;
@@ -492,7 +502,7 @@ make_config! {
         /// Invitation organization name |> Name shown in the invitation emails that don't come from a specific organization
         invitation_org_name:    String, true,   def,    "Vaultwarden".to_string();
 
-        /// Events days retain |> Number of days to retain events stored in the database. If unset, events are kept indefently.
+        /// Events days retain |> Number of days to retain events stored in the database. If unset, events are kept indefinitely.
         events_days_retain:     i64,    false,   option;
     },
 
@@ -520,7 +530,7 @@ make_config! {
         /// has been decided on, consider using permanent redirects for cacheability. The legacy codes
         /// are currently better supported by the Bitwarden clients.
         icon_redirect_code:     u32,    true,   def,    302;
-        /// Positive icon cache expiry |> Number of seconds to consider that an already cached icon is fresh. After this period, the icon will be redownloaded
+        /// Positive icon cache expiry |> Number of seconds to consider that an already cached icon is fresh. After this period, the icon will be refreshed
         icon_cache_ttl:         u64,    true,   def,    2_592_000;
         /// Negative icon cache expiry |> Number of seconds before trying to download an icon that failed again.
         icon_cache_negttl:      u64,    true,   def,    259_200;
@@ -530,7 +540,7 @@ make_config! {
         /// Useful to hide other servers in the local network. Check the WIKI for more details
         icon_blacklist_regex:   String, true,   option;
         /// Icon blacklist non global IPs |> Any IP which is not defined as a global IP will be blacklisted.
-        /// Usefull to secure your internal environment: See https://en.wikipedia.org/wiki/Reserved_IP_addresses for a list of IPs which it will block
+        /// Useful to secure your internal environment: See https://en.wikipedia.org/wiki/Reserved_IP_addresses for a list of IPs which it will block
         icon_blacklist_non_global_ips:  bool,   true,   def,    true;
 
         /// Disable Two-Factor remember |> Enabling this would force the users to use a second factor to login every time.
@@ -540,6 +550,9 @@ make_config! {
         /// Disable authenticator time drifted codes to be valid |> Enabling this only allows the current TOTP code to be valid
         /// TOTP codes of the previous and next 30 seconds will be invalid.
         authenticator_disable_time_drift: bool, true, def, false;
+
+        /// Customize the enabled feature flags on the clients |> This is a comma separated list of feature flags to enable.
+        experimental_client_feature_flags: String, false, def, "fido2-vault-credentials".to_string();
 
         /// Require new device emails |> When a user logs in an email is required to be sent.
         /// If sending the email fails the login attempt will fail.
@@ -566,7 +579,7 @@ make_config! {
         /// Max database connection retries |> Number of times to retry the database connection during startup, with 1 second between each retry, set to 0 to retry indefinitely
         db_connection_retries:  u32,    false,  def,    15;
 
-        /// Timeout when aquiring database connection
+        /// Timeout when acquiring database connection
         database_timeout:       u64,    false,  def,    30;
 
         /// Database connection pool size
@@ -745,6 +758,57 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         )
     }
 
+    if cfg.push_enabled {
+        let push_relay_uri = cfg.push_relay_uri.to_lowercase();
+        if !push_relay_uri.starts_with("https://") {
+            err!("`PUSH_RELAY_URI` must start with 'https://'.")
+        }
+
+        if Url::parse(&push_relay_uri).is_err() {
+            err!("Invalid URL format for `PUSH_RELAY_URI`.");
+        }
+
+        let push_identity_uri = cfg.push_identity_uri.to_lowercase();
+        if !push_identity_uri.starts_with("https://") {
+            err!("`PUSH_IDENTITY_URI` must start with 'https://'.")
+        }
+
+        if Url::parse(&push_identity_uri).is_err() {
+            err!("Invalid URL format for `PUSH_IDENTITY_URI`.");
+        }
+    }
+
+    // TODO: deal with deprecated flags so they can be removed from this list, cf. #4263
+    const KNOWN_FLAGS: &[&str] =
+        &["autofill-overlay", "autofill-v2", "browser-fileless-import", "fido2-vault-credentials"];
+    let configured_flags = parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags);
+    let invalid_flags: Vec<_> = configured_flags.keys().filter(|flag| !KNOWN_FLAGS.contains(&flag.as_str())).collect();
+    if !invalid_flags.is_empty() {
+        err!(format!("Unrecognized experimental client feature flags: {invalid_flags:?}.\n\n\
+                     Please ensure all feature flags are spelled correctly and that they are supported in this version.\n\
+                     Supported flags: {KNOWN_FLAGS:?}"));
+    }
+
+    const MAX_FILESIZE_KB: i64 = i64::MAX >> 10;
+
+    if let Some(limit) = cfg.user_attachment_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`USER_ATTACHMENT_LIMIT` is out of bounds");
+        }
+    }
+
+    if let Some(limit) = cfg.org_attachment_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`ORG_ATTACHMENT_LIMIT` is out of bounds");
+        }
+    }
+
+    if let Some(limit) = cfg.user_send_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`USER_SEND_LIMIT` is out of bounds");
+        }
+    }
+
     if cfg._enable_duo
         && (cfg.duo_host.is_some() || cfg.duo_ikey.is_some() || cfg.duo_skey.is_some())
         && !(cfg.duo_host.is_some() && cfg.duo_ikey.is_some() && cfg.duo_skey.is_some())
@@ -891,6 +955,10 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
 
     if !cfg.event_cleanup_schedule.is_empty() && cfg.event_cleanup_schedule.parse::<Schedule>().is_err() {
         err!("`EVENT_CLEANUP_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.auth_request_purge_schedule.is_empty() && cfg.auth_request_purge_schedule.parse::<Schedule>().is_err() {
+        err!("`AUTH_REQUEST_PURGE_SCHEDULE` is not a valid cron expression")
     }
 
     if !cfg.disable_admin_token {
@@ -1189,7 +1257,10 @@ impl Config {
     }
 }
 
-use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext, RenderError, Renderable};
+use handlebars::{
+    Context, DirectorySourceOptions, Handlebars, Helper, HelperResult, Output, RenderContext, RenderErrorReason,
+    Renderable,
+};
 
 fn load_templates<P>(path: P) -> Handlebars<'static>
 where
@@ -1233,17 +1304,18 @@ where
     reg!("email/invite_accepted", ".html");
     reg!("email/invite_confirmed", ".html");
     reg!("email/new_device_logged_in", ".html");
+    reg!("email/protected_action", ".html");
     reg!("email/pw_hint_none", ".html");
     reg!("email/pw_hint_some", ".html");
     reg!("email/send_2fa_removed_from_org", ".html");
-    reg!("email/send_single_org_removed_from_org", ".html");
-    reg!("email/send_org_invite", ".html");
     reg!("email/send_emergency_access_invite", ".html");
+    reg!("email/send_org_invite", ".html");
+    reg!("email/send_single_org_removed_from_org", ".html");
+    reg!("email/smtp_test", ".html");
     reg!("email/twofactor_email", ".html");
     reg!("email/verify_email", ".html");
-    reg!("email/welcome", ".html");
     reg!("email/welcome_must_verify", ".html");
-    reg!("email/smtp_test", ".html");
+    reg!("email/welcome", ".html");
 
     reg!("admin/base");
     reg!("admin/login");
@@ -1257,19 +1329,27 @@ where
     // And then load user templates to overwrite the defaults
     // Use .hbs extension for the files
     // Templates get registered with their relative name
-    hb.register_templates_directory(".hbs", path).unwrap();
+    hb.register_templates_directory(
+        path,
+        DirectorySourceOptions {
+            tpl_extension: ".hbs".to_owned(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     hb
 }
 
 fn case_helper<'reg, 'rc>(
-    h: &Helper<'reg, 'rc>,
+    h: &Helper<'rc>,
     r: &'reg Handlebars<'_>,
     ctx: &'rc Context,
     rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"case\""))?;
+    let param =
+        h.param(0).ok_or_else(|| RenderErrorReason::Other(String::from("Param not found for helper \"case\"")))?;
     let value = param.value().clone();
 
     if h.params().iter().skip(1).any(|x| x.value() == &value) {
@@ -1280,17 +1360,21 @@ fn case_helper<'reg, 'rc>(
 }
 
 fn js_escape_helper<'reg, 'rc>(
-    h: &Helper<'reg, 'rc>,
+    h: &Helper<'rc>,
     _r: &'reg Handlebars<'_>,
     _ctx: &'rc Context,
     _rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"jsesc\""))?;
+    let param =
+        h.param(0).ok_or_else(|| RenderErrorReason::Other(String::from("Param not found for helper \"jsesc\"")))?;
 
     let no_quote = h.param(1).is_some();
 
-    let value = param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"jsesc\" is not a String"))?;
+    let value = param
+        .value()
+        .as_str()
+        .ok_or_else(|| RenderErrorReason::Other(String::from("Param for helper \"jsesc\" is not a String")))?;
 
     let mut escaped_value = value.replace('\\', "").replace('\'', "\\x22").replace('\"', "\\x27");
     if !no_quote {
@@ -1302,15 +1386,18 @@ fn js_escape_helper<'reg, 'rc>(
 }
 
 fn to_json<'reg, 'rc>(
-    h: &Helper<'reg, 'rc>,
+    h: &Helper<'rc>,
     _r: &'reg Handlebars<'_>,
     _ctx: &'rc Context,
     _rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h.param(0).ok_or_else(|| RenderError::new("Expected 1 parameter for \"to_json\""))?.value();
+    let param = h
+        .param(0)
+        .ok_or_else(|| RenderErrorReason::Other(String::from("Expected 1 parameter for \"to_json\"")))?
+        .value();
     let json = serde_json::to_string(param)
-        .map_err(|e| RenderError::new(format!("Can't serialize parameter to JSON: {e}")))?;
+        .map_err(|e| RenderErrorReason::Other(format!("Can't serialize parameter to JSON: {e}")))?;
     out.write(&json)?;
     Ok(())
 }

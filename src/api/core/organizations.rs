@@ -5,15 +5,14 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        core::{log_event, CipherSyncData, CipherSyncType},
-        ApiResult, EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, JsonVec, Notify, NumberOrString, PasswordData,
-        UpdateType,
+        core::{log_event, two_factor, CipherSyncData, CipherSyncType},
+        EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, JsonVec, Notify, PasswordOrOtpData, UpdateType,
     },
     auth::{decode_invite, AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OwnerHeaders},
     db::{models::*, DbConn},
     error::Error,
     mail,
-    util::convert_json_key_lcase_first,
+    util::{convert_json_key_lcase_first, NumberOrString},
     CONFIG,
 };
 
@@ -61,6 +60,7 @@ pub fn routes() -> Vec<Route> {
         put_policy,
         get_organization_tax,
         get_plans,
+        get_plans_all,
         get_plans_tax_rates,
         import,
         post_org_keys,
@@ -124,6 +124,7 @@ struct NewCollectionData {
     Name: String,
     Groups: Vec<NewCollectionObjectData>,
     Users: Vec<NewCollectionObjectData>,
+    ExternalId: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -168,7 +169,7 @@ async fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, mut co
 
     let org = Organization::new(data.Name, data.BillingEmail, private_key, public_key);
     let mut user_org = UserOrganization::new(headers.user.uuid, org.uuid.clone());
-    let collection = Collection::new(org.uuid.clone(), data.CollectionName);
+    let collection = Collection::new(org.uuid.clone(), data.CollectionName, None);
 
     user_org.akey = data.Key;
     user_org.access_all = true;
@@ -185,16 +186,13 @@ async fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, mut co
 #[delete("/organizations/<org_id>", data = "<data>")]
 async fn delete_organization(
     org_id: &str,
-    data: JsonUpcase<PasswordData>,
+    data: JsonUpcase<PasswordOrOtpData>,
     headers: OwnerHeaders,
     mut conn: DbConn,
 ) -> EmptyResult {
-    let data: PasswordData = data.into_inner().data;
-    let password_hash = data.MasterPasswordHash;
+    let data: PasswordOrOtpData = data.into_inner().data;
 
-    if !headers.user.check_valid_password(&password_hash) {
-        err!("Invalid password")
-    }
+    data.validate(&headers.user, true, &mut conn).await?;
 
     match Organization::find_by_uuid(org_id, &mut conn).await {
         None => err!("Organization not found"),
@@ -205,7 +203,7 @@ async fn delete_organization(
 #[post("/organizations/<org_id>/delete", data = "<data>")]
 async fn post_delete_organization(
     org_id: &str,
-    data: JsonUpcase<PasswordData>,
+    data: JsonUpcase<PasswordOrOtpData>,
     headers: OwnerHeaders,
     conn: DbConn,
 ) -> EmptyResult {
@@ -227,7 +225,7 @@ async fn leave_organization(org_id: &str, headers: Headers, mut conn: DbConn) ->
                 EventType::OrganizationUserRemoved as i32,
                 &user_org.uuid,
                 org_id,
-                headers.user.uuid.clone(),
+                &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
                 &mut conn,
@@ -280,7 +278,7 @@ async fn post_organization(
         EventType::OrganizationUpdated as i32,
         org_id,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -295,7 +293,7 @@ async fn post_organization(
 async fn get_user_collections(headers: Headers, mut conn: DbConn) -> Json<Value> {
     Json(json!({
         "Data":
-            Collection::find_by_user_uuid(headers.user.uuid.clone(), &mut conn).await
+            Collection::find_by_user_uuid(headers.user.uuid, &mut conn).await
             .iter()
             .map(Collection::to_json)
             .collect::<Value>(),
@@ -390,14 +388,14 @@ async fn post_organization_collections(
         None => err!("Can't find organization details"),
     };
 
-    let collection = Collection::new(org.uuid, data.Name);
+    let collection = Collection::new(org.uuid, data.Name, data.ExternalId);
     collection.save(&mut conn).await?;
 
     log_event(
         EventType::CollectionCreated as i32,
         &collection.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -422,6 +420,10 @@ async fn post_organization_collections(
 
         CollectionUser::save(&org_user.user_uuid, &collection.uuid, user.ReadOnly, user.HidePasswords, &mut conn)
             .await?;
+    }
+
+    if headers.org_user.atype == UserOrgType::Manager && !headers.org_user.access_all {
+        CollectionUser::save(&headers.org_user.user_uuid, &collection.uuid, false, false, &mut conn).await?;
     }
 
     Ok(Json(collection.to_json()))
@@ -463,13 +465,18 @@ async fn post_organization_collection_update(
     }
 
     collection.name = data.Name;
+    collection.external_id = match data.ExternalId {
+        Some(external_id) if !external_id.trim().is_empty() => Some(external_id),
+        _ => None,
+    };
+
     collection.save(&mut conn).await?;
 
     log_event(
         EventType::CollectionUpdated as i32,
         &collection.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -557,7 +564,7 @@ async fn _delete_organization_collection(
                     EventType::CollectionDeleted as i32,
                     &collection.uuid,
                     org_id,
-                    headers.user.uuid.clone(),
+                    &headers.user.uuid,
                     headers.device.atype,
                     &headers.ip.ip,
                     conn,
@@ -603,7 +610,6 @@ async fn post_organization_collection_delete(
 #[allow(non_snake_case)]
 struct BulkCollectionIds {
     Ids: Vec<String>,
-    OrganizationId: String,
 }
 
 #[delete("/organizations/<org_id>/collections", data = "<data>")]
@@ -614,9 +620,6 @@ async fn bulk_delete_organization_collections(
     mut conn: DbConn,
 ) -> EmptyResult {
     let data: BulkCollectionIds = data.into_inner().data;
-    if org_id != data.OrganizationId {
-        err!("OrganizationId mismatch");
-    }
 
     let collections = data.Ids;
 
@@ -849,6 +852,7 @@ struct CollectionData {
 #[allow(non_snake_case)]
 struct InviteData {
     Emails: Vec<String>,
+    Groups: Vec<String>,
     Type: NumberOrString,
     Collections: Option<Vec<CollectionData>>,
     AccessAll: Option<bool>,
@@ -928,11 +932,16 @@ async fn send_invite(
 
         new_user.save(&mut conn).await?;
 
+        for group in data.Groups.iter() {
+            let mut group_entry = GroupUser::new(String::from(group), user.uuid.clone());
+            group_entry.save(&mut conn).await?;
+        }
+
         log_event(
             EventType::OrganizationUserInvited as i32,
             &new_user.uuid,
             org_id,
-            headers.user.uuid.clone(),
+            &headers.user.uuid,
             headers.device.atype,
             &headers.ip.ip,
             &mut conn,
@@ -1226,7 +1235,7 @@ async fn _confirm_invite(
         EventType::OrganizationUserConfirmed as i32,
         &user_to_confirm.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         conn,
@@ -1388,7 +1397,7 @@ async fn edit_user(
         EventType::OrganizationUserUpdated as i32,
         &user_to_edit.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -1480,7 +1489,7 @@ async fn _delete_user(
         EventType::OrganizationUserRemoved as i32,
         &user_to_delete.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         conn,
@@ -1504,9 +1513,9 @@ async fn bulk_public_keys(
     let data: OrgBulkIds = data.into_inner().data;
 
     let mut bulk_response = Vec::new();
-    // Check all received UserOrg UUID's and find the matching User to retreive the public-key.
+    // Check all received UserOrg UUID's and find the matching User to retrieve the public-key.
     // If the user does not exists, just ignore it, and do not return any information regarding that UserOrg UUID.
-    // The web-vault will then ignore that user for the folowing steps.
+    // The web-vault will then ignore that user for the following steps.
     for user_org_id in data.Ids {
         match UserOrganization::find_by_uuid_and_org(&user_org_id, org_id, &mut conn).await {
             Some(user_org) => match User::find_by_uuid(&user_org.user_uuid, &mut conn).await {
@@ -1570,7 +1579,7 @@ async fn post_org_import(
 
     let mut collections = Vec::new();
     for coll in data.Collections {
-        let collection = Collection::new(org_id.clone(), coll.Name);
+        let collection = Collection::new(org_id.clone(), coll.Name, coll.ExternalId);
         if collection.save(&mut conn).await.is_err() {
             collections.push(Err(Error::new("Failed to create Collection", "Failed to create Collection")));
         } else {
@@ -1683,38 +1692,16 @@ async fn put_policy(
         None => err!("Invalid or unsupported policy type"),
     };
 
-    // When enabling the TwoFactorAuthentication policy, remove this org's members that do have 2FA
+    // When enabling the TwoFactorAuthentication policy, revoke all members that do not have 2FA
     if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
-        for member in UserOrganization::find_by_org(org_id, &mut conn).await.into_iter() {
-            let user_twofactor_disabled = TwoFactor::find_by_user(&member.user_uuid, &mut conn).await.is_empty();
-
-            // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
-            // Invited users still need to accept the invite and will get an error when they try to accept the invite.
-            if user_twofactor_disabled
-                && member.atype < UserOrgType::Admin
-                && member.status != UserOrgStatus::Invited as i32
-            {
-                if CONFIG.mail_enabled() {
-                    let org = Organization::find_by_uuid(&member.org_uuid, &mut conn).await.unwrap();
-                    let user = User::find_by_uuid(&member.user_uuid, &mut conn).await.unwrap();
-
-                    mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
-                }
-
-                log_event(
-                    EventType::OrganizationUserRemoved as i32,
-                    &member.uuid,
-                    org_id,
-                    headers.user.uuid.clone(),
-                    headers.device.atype,
-                    &headers.ip.ip,
-                    &mut conn,
-                )
-                .await;
-
-                member.delete(&mut conn).await?;
-            }
-        }
+        two_factor::enforce_2fa_policy_for_org(
+            org_id,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &mut conn,
+        )
+        .await?;
     }
 
     // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
@@ -1739,7 +1726,7 @@ async fn put_policy(
                     EventType::OrganizationUserRemoved as i32,
                     &member.uuid,
                     org_id,
-                    headers.user.uuid.clone(),
+                    &headers.user.uuid,
                     headers.device.atype,
                     &headers.ip.ip,
                     &mut conn,
@@ -1764,7 +1751,7 @@ async fn put_policy(
         EventType::PolicyUpdated as i32,
         &policy.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -1795,10 +1782,26 @@ fn get_plans() -> Json<Value> {
             "Product": 0,
             "Name": "Free",
             "NameLocalizationKey": "planNameFree",
+            "BitwardenProduct": 0,
+            "MaxUsers": 0,
+            "DescriptionLocalizationKey": "planDescFree"
+        },{
+            "Object": "plan",
+            "Type": 0,
+            "Product": 1,
+            "Name": "Free",
+            "NameLocalizationKey": "planNameFree",
+            "BitwardenProduct": 1,
+            "MaxUsers": 0,
             "DescriptionLocalizationKey": "planDescFree"
         }],
         "ContinuationToken": null
     }))
+}
+
+#[get("/plans/all")]
+fn get_plans_all() -> Json<Value> {
+    get_plans()
 }
 
 #[get("/plans/sales-tax-rates")]
@@ -1850,7 +1853,7 @@ async fn import(org_id: &str, data: JsonUpcase<OrgImportData>, headers: Headers,
     // This means that this endpoint can end up removing users that were added manually by an admin,
     // as opposed to upstream which only removes auto-imported users.
 
-    // User needs to be admin or owner to use the Directry Connector
+    // User needs to be admin or owner to use the Directory Connector
     match UserOrganization::find_by_user_and_org(&headers.user.uuid, org_id, &mut conn).await {
         Some(user_org) if user_org.atype >= UserOrgType::Admin => { /* Okay, nothing to do */ }
         Some(_) => err!("User has insufficient permissions to use Directory Connector"),
@@ -1865,7 +1868,7 @@ async fn import(org_id: &str, data: JsonUpcase<OrgImportData>, headers: Headers,
                     EventType::OrganizationUserRemoved as i32,
                     &user_org.uuid,
                     org_id,
-                    headers.user.uuid.clone(),
+                    &headers.user.uuid,
                     headers.device.atype,
                     &headers.ip.ip,
                     &mut conn,
@@ -1895,7 +1898,7 @@ async fn import(org_id: &str, data: JsonUpcase<OrgImportData>, headers: Headers,
                     EventType::OrganizationUserInvited as i32,
                     &new_org_user.uuid,
                     org_id,
-                    headers.user.uuid.clone(),
+                    &headers.user.uuid,
                     headers.device.atype,
                     &headers.ip.ip,
                     &mut conn,
@@ -1931,7 +1934,7 @@ async fn import(org_id: &str, data: JsonUpcase<OrgImportData>, headers: Headers,
                         EventType::OrganizationUserRemoved as i32,
                         &user_org.uuid,
                         org_id,
-                        headers.user.uuid.clone(),
+                        &headers.user.uuid,
                         headers.device.atype,
                         &headers.ip.ip,
                         &mut conn,
@@ -2044,7 +2047,7 @@ async fn _revoke_organization_user(
                 EventType::OrganizationUserRevoked as i32,
                 &user_org.uuid,
                 org_id,
-                headers.user.uuid.clone(),
+                &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
                 conn,
@@ -2163,7 +2166,7 @@ async fn _restore_organization_user(
                 EventType::OrganizationUserRestored as i32,
                 &user_org.uuid,
                 org_id,
-                headers.user.uuid.clone(),
+                &headers.user.uuid,
                 headers.device.atype,
                 &headers.ip.ip,
                 conn,
@@ -2210,29 +2213,22 @@ struct GroupRequest {
 }
 
 impl GroupRequest {
-    pub fn to_group(&self, organizations_uuid: &str) -> ApiResult<Group> {
-        match self.AccessAll {
-            Some(access_all_value) => Ok(Group::new(
-                organizations_uuid.to_owned(),
-                self.Name.clone(),
-                access_all_value,
-                self.ExternalId.clone(),
-            )),
-            _ => err!("Could not convert GroupRequest to Group, because AccessAll has no value!"),
-        }
+    pub fn to_group(&self, organizations_uuid: &str) -> Group {
+        Group::new(
+            String::from(organizations_uuid),
+            self.Name.clone(),
+            self.AccessAll.unwrap_or(false),
+            self.ExternalId.clone(),
+        )
     }
 
-    pub fn update_group(&self, mut group: Group) -> ApiResult<Group> {
-        match self.AccessAll {
-            Some(access_all_value) => {
-                group.name = self.Name.clone();
-                group.access_all = access_all_value;
-                group.set_external_id(self.ExternalId.clone());
+    pub fn update_group(&self, mut group: Group) -> Group {
+        group.name = self.Name.clone();
+        group.access_all = self.AccessAll.unwrap_or(false);
+        // Group Updates do not support changing the external_id
+        // These input fields are in a disabled state, and can only be updated/added via ldap_import
 
-                Ok(group)
-            }
-            _ => err!("Could not update group, because AccessAll has no value!"),
-        }
+        group
     }
 }
 
@@ -2293,13 +2289,13 @@ async fn post_groups(
     }
 
     let group_request = data.into_inner().data;
-    let group = group_request.to_group(org_id)?;
+    let group = group_request.to_group(org_id);
 
     log_event(
         EventType::GroupCreated as i32,
         &group.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -2327,7 +2323,7 @@ async fn put_group(
     };
 
     let group_request = data.into_inner().data;
-    let updated_group = group_request.update_group(group)?;
+    let updated_group = group_request.update_group(group);
 
     CollectionGroup::delete_all_by_group(group_id, &mut conn).await?;
     GroupUser::delete_all_by_group(group_id, &mut conn).await?;
@@ -2336,7 +2332,7 @@ async fn put_group(
         EventType::GroupUpdated as i32,
         &updated_group.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -2369,7 +2365,7 @@ async fn add_update_group(
             EventType::OrganizationUserUpdatedGroups as i32,
             &assigned_user_id,
             org_id,
-            headers.user.uuid.clone(),
+            &headers.user.uuid,
             headers.device.atype,
             &headers.ip.ip,
             conn,
@@ -2424,7 +2420,7 @@ async fn _delete_group(org_id: &str, group_id: &str, headers: &AdminHeaders, con
         EventType::GroupDeleted as i32,
         &group.uuid,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         conn,
@@ -2515,7 +2511,7 @@ async fn put_group_users(
             EventType::OrganizationUserUpdatedGroups as i32,
             &assigned_user_id,
             org_id,
-            headers.user.uuid.clone(),
+            &headers.user.uuid,
             headers.device.atype,
             &headers.ip.ip,
             &mut conn,
@@ -2572,10 +2568,14 @@ async fn put_user_groups(
         err!("Group support is disabled");
     }
 
-    match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
-        Some(_) => { /* Do nothing */ }
+    let user_org = match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
+        Some(uo) => uo,
         _ => err!("User could not be found!"),
     };
+
+    if user_org.org_uuid != org_id {
+        err!("Group doesn't belong to organization");
+    }
 
     GroupUser::delete_all_by_user(org_user_id, &mut conn).await?;
 
@@ -2589,7 +2589,7 @@ async fn put_user_groups(
         EventType::OrganizationUserUpdatedGroups as i32,
         org_user_id,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -2622,21 +2622,29 @@ async fn delete_group_user(
         err!("Group support is disabled");
     }
 
-    match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
-        Some(_) => { /* Do nothing */ }
+    let user_org = match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
+        Some(uo) => uo,
         _ => err!("User could not be found!"),
     };
 
-    match Group::find_by_uuid(group_id, &mut conn).await {
-        Some(_) => { /* Do nothing */ }
+    if user_org.org_uuid != org_id {
+        err!("User doesn't belong to organization");
+    }
+
+    let group = match Group::find_by_uuid(group_id, &mut conn).await {
+        Some(g) => g,
         _ => err!("Group could not be found!"),
     };
+
+    if group.organizations_uuid != org_id {
+        err!("Group doesn't belong to organization");
+    }
 
     log_event(
         EventType::OrganizationUserUpdatedGroups as i32,
         org_user_id,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -2650,6 +2658,8 @@ async fn delete_group_user(
 #[allow(non_snake_case)]
 struct OrganizationUserResetPasswordEnrollmentRequest {
     ResetPasswordKey: Option<String>,
+    MasterPasswordHash: Option<String>,
+    Otp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2724,7 +2734,7 @@ async fn put_reset_password(
         EventType::OrganizationUserAdminResetPassword as i32,
         org_user_id,
         org_id,
-        headers.user.uuid.clone(),
+        &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
         &mut conn,
@@ -2831,6 +2841,15 @@ async fn put_reset_password_enrollment(
         err!("Reset password can't be withdrawed due to an enterprise policy");
     }
 
+    if reset_request.ResetPasswordKey.is_some() {
+        PasswordOrOtpData {
+            MasterPasswordHash: reset_request.MasterPasswordHash,
+            Otp: reset_request.Otp,
+        }
+        .validate(&headers.user, true, &mut conn)
+        .await?;
+    }
+
     org_user.reset_password_key = reset_request.ResetPasswordKey;
     org_user.save(&mut conn).await?;
 
@@ -2840,15 +2859,14 @@ async fn put_reset_password_enrollment(
         EventType::OrganizationUserResetPasswordWithdraw as i32
     };
 
-    log_event(log_id, org_user_id, org_id, headers.user.uuid.clone(), headers.device.atype, &headers.ip.ip, &mut conn)
-        .await;
+    log_event(log_id, org_user_id, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &mut conn).await;
 
     Ok(())
 }
 
 // This is a new function active since the v2022.9.x clients.
 // It combines the previous two calls done before.
-// We call those two functions here and combine them our selfs.
+// We call those two functions here and combine them ourselves.
 //
 // NOTE: It seems clients can't handle uppercase-first keys!!
 //       We need to convert all keys so they have the first character to be a lowercase.
@@ -2896,18 +2914,16 @@ async fn get_org_export(org_id: &str, headers: AdminHeaders, mut conn: DbConn) -
 
 async fn _api_key(
     org_id: &str,
-    data: JsonUpcase<PasswordData>,
+    data: JsonUpcase<PasswordOrOtpData>,
     rotate: bool,
     headers: AdminHeaders,
-    conn: DbConn,
+    mut conn: DbConn,
 ) -> JsonResult {
-    let data: PasswordData = data.into_inner().data;
+    let data: PasswordOrOtpData = data.into_inner().data;
     let user = headers.user;
 
-    // Validate the admin users password
-    if !user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password")
-    }
+    // Validate the admin users password/otp
+    data.validate(&user, true, &mut conn).await?;
 
     let org_api_key = match OrganizationApiKey::find_by_org_uuid(org_id, &conn).await {
         Some(mut org_api_key) => {
@@ -2934,14 +2950,14 @@ async fn _api_key(
 }
 
 #[post("/organizations/<org_id>/api-key", data = "<data>")]
-async fn api_key(org_id: &str, data: JsonUpcase<PasswordData>, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn api_key(org_id: &str, data: JsonUpcase<PasswordOrOtpData>, headers: AdminHeaders, conn: DbConn) -> JsonResult {
     _api_key(org_id, data, false, headers, conn).await
 }
 
 #[post("/organizations/<org_id>/rotate-api-key", data = "<data>")]
 async fn rotate_api_key(
     org_id: &str,
-    data: JsonUpcase<PasswordData>,
+    data: JsonUpcase<PasswordOrOtpData>,
     headers: AdminHeaders,
     conn: DbConn,
 ) -> JsonResult {

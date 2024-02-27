@@ -1,34 +1,3 @@
-#![forbid(unsafe_code, non_ascii_idents)]
-#![deny(
-    rust_2018_idioms,
-    rust_2021_compatibility,
-    noop_method_call,
-    pointer_structural_match,
-    trivial_casts,
-    trivial_numeric_casts,
-    unused_import_braces,
-    clippy::cast_lossless,
-    clippy::clone_on_ref_ptr,
-    clippy::equatable_if_let,
-    clippy::float_cmp_const,
-    clippy::inefficient_to_string,
-    clippy::iter_on_empty_collections,
-    clippy::iter_on_single_items,
-    clippy::linkedlist,
-    clippy::macro_use_imports,
-    clippy::manual_assert,
-    clippy::manual_instant_elapsed,
-    clippy::manual_string_new,
-    clippy::match_wildcard_for_single_variants,
-    clippy::mem_forget,
-    clippy::string_add_assign,
-    clippy::string_to_string,
-    clippy::unnecessary_join,
-    clippy::unnecessary_self_imports,
-    clippy::unused_async,
-    clippy::verbose_file_reads,
-    clippy::zero_sized_map_values
-)]
 #![cfg_attr(feature = "unstable", feature(ip))]
 // The recursion_limit is mainly triggered by the json!() macro.
 // The more key/value pairs there are the more recursion occurs.
@@ -82,10 +51,13 @@ mod mail;
 mod ratelimit;
 mod util;
 
+use crate::api::purge_auth_requests;
+use crate::api::WS_ANONYMOUS_SUBSCRIPTIONS;
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
 use rocket::data::{Limits, ToByteUnit};
-pub use util::is_running_in_docker;
+use std::sync::Arc;
+pub use util::is_running_in_container;
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
@@ -258,6 +230,13 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         log::LevelFilter::Off
     };
 
+    // Only show handlebar logs when the level is Trace
+    let handlebars_level = if level >= log::LevelFilter::Trace {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Warn
+    };
+
     let mut logger = fern::Dispatch::new()
         .level(level)
         // Hide unknown certificate errors if using self-signed
@@ -279,6 +258,8 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         .level_for("rocket::shield::shield", log::LevelFilter::Warn)
         .level_for("hyper::proto", log::LevelFilter::Off)
         .level_for("hyper::client", log::LevelFilter::Off)
+        // Filter handlebars logs
+        .level_for("handlebars::render", handlebars_level)
         // Prevent cookie_store logs
         .level_for("cookie_store", log::LevelFilter::Off)
         // Variable level for trust-dns used by reqwest
@@ -314,7 +295,16 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
     }
 
     if let Some(log_file) = CONFIG.log_file() {
-        logger = logger.chain(fern::log_file(log_file)?);
+        #[cfg(windows)]
+        {
+            logger = logger.chain(fern::log_file(log_file)?);
+        }
+        #[cfg(not(windows))]
+        {
+            const SIGHUP: i32 = tokio::signal::unix::SignalKind::hangup().as_raw_value();
+            let path = Path::new(&log_file);
+            logger = logger.chain(fern::log_reopen1(path, [SIGHUP])?);
+        }
     }
 
     #[cfg(not(windows))]
@@ -394,7 +384,7 @@ async fn check_data_folder() {
     let path = Path::new(data_folder);
     if !path.exists() {
         error!("Data folder '{}' doesn't exist.", data_folder);
-        if is_running_in_docker() {
+        if is_running_in_container() {
             error!("Verify that your data volume is mounted at the correct location.");
         } else {
             error!("Create the data folder and try again.");
@@ -406,9 +396,9 @@ async fn check_data_folder() {
         exit(1);
     }
 
-    if is_running_in_docker()
+    if is_running_in_container()
         && std::env::var("I_REALLY_WANT_VOLATILE_STORAGE").is_err()
-        && !docker_data_folder_is_persistent(data_folder).await
+        && !container_data_folder_is_persistent(data_folder).await
     {
         error!(
             "No persistent volume!\n\
@@ -427,7 +417,7 @@ async fn check_data_folder() {
 /// A none persistent volume in either Docker or Podman is represented by a 64 alphanumerical string.
 /// If we detect this string, we will alert about not having a persistent self defined volume.
 /// This probably means that someone forgot to add `-v /path/to/vaultwarden_data/:/data`
-async fn docker_data_folder_is_persistent(data_folder: &str) -> bool {
+async fn container_data_folder_is_persistent(data_folder: &str) -> bool {
     if let Ok(mountinfo) = File::open("/proc/self/mountinfo").await {
         // Since there can only be one mountpoint to the DATA_FOLDER
         // We do a basic check for this mountpoint surrounded by a space.
@@ -533,6 +523,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
         .manage(api::start_notification_server())
+        .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
         .attach(util::AppHeaders())
         .attach(util::Cors())
         .attach(util::BetterLogging(extra_debug))
@@ -605,6 +596,12 @@ fn schedule_jobs(pool: db::DbPool) {
             if !CONFIG.emergency_notification_reminder_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.emergency_notification_reminder_schedule().parse().unwrap(), || {
                     runtime.spawn(api::emergency_notification_reminder_job(pool.clone()));
+                }));
+            }
+
+            if !CONFIG.auth_request_purge_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.auth_request_purge_schedule().parse().unwrap(), || {
+                    runtime.spawn(purge_auth_requests(pool.clone()));
                 }));
             }
 
